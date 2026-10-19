@@ -28,14 +28,12 @@ if not (gemini_key and turso_url and turso_token):
 
 client = genai.Client(api_key=gemini_key.strip())
 
-# Automatic fallback list when a model experiences 503 High Demand
-FALLBACK_MODELS = ["gemini-3.8-flash",
+# Updated active model list
+FALLBACK_MODELS = [
+    "gemini-2.5-flash",
     "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-    "gemini-1.5-flash",
 ]
 
-# --- Section Marker Patterns (Upgrade 2) ---
 SECTION_MARKERS = {
     "vardaan": ["वरदान:", "वरदान :-", "वरदान-", "वरदान :", "वरदान"],
     "slogan": ["स्लोगन:", "स्लोगन :-", "स्लोगन-", "स्लोगन :", "स्लोगन"],
@@ -45,7 +43,7 @@ SECTION_MARKERS = {
 
 
 def call_gemini_resilient(contents, config=None):
-    """Calls Gemini API with automatic retry and model fallback on 503/429 errors."""
+    """Calls Gemini API with automatic retry and model fallback on errors."""
     last_error = None
     for model_name in FALLBACK_MODELS:
         for attempt in range(2):
@@ -72,26 +70,6 @@ def get_turso_client():
     return libsql_client.create_client_sync(url=http_url, auth_token=turso_token.strip())
 
 
-def transcribe_audio(audio_bytes: bytes, mime_type: str) -> str:
-    """Uses Gemini multimodal audio processing to transcribe spoken queries."""
-    prompt = (
-        "Listen to this audio and transcribe the spoken Hindi, English, or Hinglish question accurately. "
-        "It is a question about Brahma Kumaris Murli concepts (e.g., Avyakt, Sakar, Baba, Vardaan, Slogan, Dharna, Pavitrata, Yog). "
-        "Prefer Devanagari Hindi script for Hindi words. Return ONLY the plain transcribed text."
-    )
-    try:
-        response = call_gemini_resilient(
-            contents=[
-                types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
-                prompt
-            ]
-        )
-        return response.text.strip()
-    except Exception as e:
-        st.error(f"Voice Transcription Error: {e}")
-        return ""
-
-
 def extract_search_intent(user_query: str, ui_section_override: str = "All Sections") -> dict:
     """Extracts core concepts, semantic Yuktis, and section filters."""
     prompt = f"""
@@ -100,8 +78,8 @@ You are a senior Brahma Kumaris Murli scholar. Analyze this user query: "{user_q
 Return a valid JSON object with these exact keys:
 1. "collection": "avyakt" (if user asks for Avyakt Murli / BapDada), "daily" (if Sakar / Daily Murli), or null.
 2. "section_focus": "vardaan" (if asking for a Vardaan / blessing), "slogan" (if asking for a Slogan), "dharna" (if asking for Dharna points), "saar" (if asking for Mukhya Saar / essence), or null.
-3. "date_filter": string (e.g., "1979", "2022-07", "18-01") if a specific year or date is mentioned, else null.
-4. "core_concepts": list of 1 to 3 essential Hindi words/roots in Devanagari (e.g., "पवित्रता", "मास्टर", "सर्वशक्ति"). Do NOT include generic words like बाबा, मुरली, वरदान, स्लोगन, कहा, क्या, कैसे.
+3. "date_filter": string if a specific year or date is mentioned, else null.
+4. "core_concepts": list of 1 to 3 essential Hindi words/roots in Devanagari (e.g., "वैराग्य", "दुनिया", "निशानी"). Do NOT include generic words like बाबा, मुरली.
 5. "synonyms": list of 2 to 4 alternative Hindi spellings or closely related Murli terms in Devanagari.
 6. "semantic_yuktis": list of 2 to 3 deeper BK Murli metaphors or Yuktis Baba uses for this topic in Devanagari.
 
@@ -117,7 +95,7 @@ Output ONLY valid JSON.
         )
         data = json.loads(response.text.strip())
     except Exception:
-        stop_words = {"किस", "अव्यक्त", "साकार", "मुरली", "में", "बाबा", "ने", "कहा", "है", "कि", "से", "ही", "बनते", "क्या", "कैसे", "वरदान", "स्लोगन"}
+        stop_words = {"किस", "अव्यक्त", "साकार", "मुरली", "में", "बाबा", "ने", "कहा", "है", "कि", "से", "ही", "क्या", "कैसे", "निशानी", "क्या", "होगी"}
         words = [w.strip() for w in user_query.split() if w.strip() not in stop_words and len(w.strip()) > 2]
         data = {
             "collection": "avyakt" if ("अव्यक्त" in user_query or "avyakt" in user_query.lower()) else None,
@@ -276,7 +254,7 @@ def score_and_extract_passages(full_text: str, intent: dict, window_chars: int =
 
 
 def search_turso(intent: dict, final_limit: int = 20) -> tuple[list[dict], str]:
-    """Retrieves up to 50 candidate Murlis and returns the top 20 re-ranked results."""
+    """Retrieves candidate Murlis and returns top 20 re-ranked results."""
     core = [t.replace('"', '').replace("'", "").strip() for t in intent.get("core_concepts", []) if t.strip()]
     syns = [t.replace('"', '').replace("'", "").strip() for t in intent.get("synonyms", []) if t.strip()]
     yuktis = [t.replace('"', '').replace("'", "").strip() for t in intent.get("semantic_yuktis", []) if t.strip()]
@@ -295,36 +273,26 @@ def search_turso(intent: dict, final_limit: int = 20) -> tuple[list[dict], str]:
         return [], "none"
 
     fts_tiers = []
-
     if section_term and core:
         core_or_syn = " OR ".join([f'"{t}"' for t in (core + syns)])
         fts_tiers.append((f"Section-Targeted ({section_term})", f'"{section_term}" AND ({core_or_syn})'))
-
     if len(core) >= 2:
         fts_tiers.append(("Strict Concept Match", " AND ".join([f'"{c}"' for c in core])))
-
     if len(core) >= 1 and len(all_terms) >= 2:
         others = " OR ".join([f'"{t}"' for t in all_terms[1:]])
         fts_tiers.append(("Contextual + Synonym Match", f'"{core[0]}" AND ({others})'))
-
-    if len(core) >= 3:
-        pair_q = f'("{core[0]}" AND "{core[1]}") OR ("{core[0]}" AND "{core[2]}") OR ("{core[1]}" AND "{core[2]}")'
-        fts_tiers.append(("Pairwise Concept Match", pair_q))
-
     fts_tiers.append(("Semantic & Yukti Expansion", " OR ".join([f'"{t}"' for t in all_terms])))
 
     coll_target = intent.get("collection")
     date_target = intent.get("date_filter")
-    candidate_pool_size = 50  # Increased candidate pool for comprehensive coverage
+    candidate_pool_size = 50
 
     def fetch_candidates(enforce_collection: bool) -> tuple[list, str]:
         where_clauses = ["murlis_fts MATCH ?"]
         extra_params = []
-
         if enforce_collection and coll_target in ["avyakt", "daily"]:
             where_clauses.append("LOWER(m.collection) LIKE ?")
             extra_params.append(f"%{coll_target.lower()}%")
-
         if date_target:
             where_clauses.append("m.murli_date LIKE ?")
             extra_params.append(f"%{date_target}%")
@@ -345,7 +313,6 @@ def search_turso(intent: dict, final_limit: int = 20) -> tuple[list[dict], str]:
         candidates = []
         seen_keys = set()
         primary_strategy = ""
-
         with get_turso_client() as db:
             for label, fts_q in fts_tiers:
                 try:
@@ -368,7 +335,6 @@ def search_turso(intent: dict, final_limit: int = 20) -> tuple[list[dict], str]:
         return candidates, primary_strategy
 
     raw_rows, strategy_label = fetch_candidates(enforce_collection=True)
-
     if not raw_rows and coll_target:
         raw_rows, strategy_label = fetch_candidates(enforce_collection=False)
         strategy_label += " (All Collections)"
@@ -411,9 +377,8 @@ def ask_gemini(question: str, context_chunks: list[dict], intent: dict) -> str:
     section_instruction = ""
     if section_focus:
         section_instruction = (
-            f"\nSPECIAL FOCUS: The user is specifically interested in the '{section_focus.upper()}' section "
-            f"(e.g., Vardaan / Slogan / Dharna). Prioritize quoting and explaining the {section_focus.upper()} "
-            f"from the provided excerpts first!"
+            f"\nSPECIAL FOCUS: The user is specifically interested in the '{section_focus.upper()}' section. "
+            f"Prioritize quoting and explaining the {section_focus.upper()} from the provided excerpts first!"
         )
 
     system_instruction = (
@@ -423,19 +388,16 @@ def ask_gemini(question: str, context_chunks: list[dict], intent: dict) -> str:
         "1. GROUNDED IN MURLI: Base your answer strictly on the provided Murli excerpts. Never invent dates or quotes.\n"
         "2. EXACT QUOTES (बाबा के महावाक्य): Always quote Baba's exact Hindi words from the excerpt inside blockquotes "
         "(> **\"...\"**) before explaining the point.\n"
-        "3. COMPREHENSIVE SYNTHESIS (15–25 POINTS): Do not limit yourself to just 4 or 5 points. Provide a thorough, "
-        "comprehensive, multi-faceted breakdown covering 15 to 25 distinct spiritual points/aspects found across the excerpts, "
-        "categorizing them clearly under bullet points or sub-headings.\n"
+        "3. COMPREHENSIVE SYNTHESIS (15–25 POINTS): Provide a thorough, comprehensive breakdown covering 15 to 25 distinct "
+        "spiritual points/aspects found across the excerpts, categorizing them clearly under bullet points or sub-headings.\n"
         "4. CLEAR CITATIONS: Cite the exact Collection and Murli Date for every point or quote.\n"
-        "5. SPIRITUAL DEPTH: Connect related spiritual expressions and explain Baba's practical Purusharth Yuktis.\n"
-        "6. LANGUAGE: Respond in the language the user asked in (Hindi or English)."
+        "5. LANGUAGE: Respond in the language the user asked in (Hindi or English)."
         + section_instruction
     )
 
     prompt = f"""
 User Question: {question}
 Core Concepts Searched: {', '.join(intent.get('core_concepts', []))}
-Semantic Yuktis Searched: {', '.join(intent.get('semantic_yuktis', []))}
 
 Retrieved Murli Excerpts:
 {formatted_context}
@@ -448,37 +410,44 @@ Provide a comprehensive, highly detailed response covering 15 to 25 distinct poi
             system_instruction=system_instruction,
             temperature=0.2,
         )
-        response = call_gemini_resilient(
-            contents=prompt,
-            config=config
-        )
+        response = call_gemini_resilient(contents=prompt, config=config)
         return response.text
     except Exception as e:
-        return f"⚠️ Gemini API Error (all fallback models busy): {e}"
+        return f"⚠️ Gemini API Error: {e}"
 
 
 # --- Session State Initialization ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "last_audio_hash" not in st.session_state:
-    st.session_state.last_audio_hash = None
 
-# --- Section Filter UI (Upgrade 2) ---
-with st.expander("🔍 Search Filters & Voice Input", expanded=False):
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        section_choice = st.selectbox(
-            "Target Murli Section:",
-            ["All Sections", "वरदान (Vardaan)", "स्लोगन (Slogan)", "धारणा (Dharna)", "मुख्य सार (Essence)"],
-            index=0
-        )
-    with col2:
-        voice_file = st.audio_input("🎙️ Record Voice Query")
+# --- Search Filters & Input UI ---
+with st.expander("🔍 Search Filters", expanded=False):
+    section_choice = st.selectbox(
+        "Target Murli Section:",
+        ["All Sections", "वरदान (Vardaan)", "स्लोगन (Slogan)", "धारणा (Dharna)", "मुख्य सार (Essence)"],
+        index=0
+    )
 
-# --- Render Conversation History ---
-for msg in st.session_state.messages:
+# --- Render Conversation History & Read Aloud Feature ---
+for idx, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
+        
+        if msg["role"] == "assistant":
+            clean_speech_text = msg["content"].replace("*", "").replace("#", "").replace(">", "").replace("---", "")
+            safe_text = json.dumps(clean_speech_text)
+            
+            st.markdown(f"""
+            <div style="margin-top: 8px; margin-bottom: 12px;">
+                <button onclick='speakText({safe_text}, "speak-btn-{idx}")' id='speak-btn-{idx}' style="background: #2b313e; color: #ffffff; border: 1px solid #41424C; border-radius: 16px; padding: 4px 12px; font-size: 13px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;">
+                    🔊 Read Aloud
+                </button>
+                <button onclick='stopSpeech()' style="background: #2b313e; color: #ff4b4b; border: 1px solid #41424C; border-radius: 16px; padding: 4px 12px; font-size: 13px; cursor: pointer; margin-left: 6px; display: inline-flex; align-items: center;">
+                    ⏹️ Stop
+                </button>
+            </div>
+            """, unsafe_allow_html=True)
+
         if msg.get("sources"):
             with st.expander("📖 View Original Murli Excerpts, Vardaans & Snippets"):
                 for s in msg["sources"]:
@@ -490,41 +459,173 @@ for msg in st.session_state.messages:
                     st.text(s["text"][:1200] + ("..." if len(s["text"]) > 1200 else ""))
                     st.divider()
 
-text_prompt = st.chat_input("Ask any Murli question, Vardaan, or Slogan...")
+# --- Global Speech Synthesis JavaScript ---
+st.markdown("""
+<script>
+function speakText(text, btnId) {
+    if (!('speechSynthesis' in window)) {
+        alert("Text-to-speech is not supported by your browser.");
+        return;
+    }
+    window.speechSynthesis.cancel();
+    
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = 'hi-IN';
+    utterance.rate = 1.0;
+    
+    const btn = document.getElementById(btnId);
+    if(btn) btn.innerText = "🔊 Speaking...";
+    
+    utterance.onend = function() { if(btn) btn.innerText = "🔊 Read Aloud"; };
+    utterance.onerror = function() { if(btn) btn.innerText = "🔊 Read Aloud"; };
+    
+    window.speechSynthesis.speak(utterance);
+}
 
-active_prompt = None
+function stopSpeech() {
+    if ('speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+        document.querySelectorAll("[id^='speak-btn-']").forEach(b => b.innerText = "🔊 Read Aloud");
+    }
+}
+</script>
+""", unsafe_allow_html=True)
 
-if voice_file is not None:
-    audio_bytes = voice_file.read()
-    audio_hash = hashlib.md5(audio_bytes).hexdigest()
-    if audio_hash != st.session_state.last_audio_hash:
-        st.session_state.last_audio_hash = audio_hash
-        with st.spinner("🎙️ Transcribing your voice query..."):
-            mime = voice_file.type or "audio/wav"
-            transcribed = transcribe_audio(audio_bytes, mime)
-            if transcribed:
-                active_prompt = transcribed
+# --- Native HTML/JS Input Bar with Built-in Mic & Unrestricted Keyboard ---
+st.markdown("""
+<style>
+.search-container {
+    display: flex;
+    align-items: center;
+    background-color: #262730;
+    border: 1px solid #41424C;
+    border-radius: 24px;
+    padding: 6px 14px;
+    margin-top: 10px;
+    margin-bottom: 20px;
+}
+.search-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    color: #ffffff;
+    font-size: 16px;
+    outline: none;
+    padding: 8px 4px;
+}
+.mic-btn {
+    background: #ff4b4b;
+    border: none;
+    border-radius: 50%;
+    width: 38px;
+    height: 38px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    color: white;
+    font-size: 18px;
+    margin-left: 8px;
+    transition: background 0.2s;
+}
+.mic-btn.listening {
+    background: #28a745;
+    animation: pulse 1.5s infinite;
+}
+@keyframes pulse {
+    0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(40, 167, 69, 0.7); }
+    70% { transform: scale(1.08); box-shadow: 0 0 0 10px rgba(40, 167, 69, 0); }
+    100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(40, 167, 69, 0); }
+}
+</style>
 
-if text_prompt:
-    active_prompt = text_prompt
+<div class="search-container">
+    <input type="text" id="murliInput" class="search-input" placeholder="Ask question, Vardaan, or Slogan..." onkeydown="if(event.key === 'Enter') submitQuery()">
+    <button id="micBtn" class="mic-btn" onclick="toggleMic()" title="Voice Search">🎙️</button>
+</div>
 
-# --- Execute Search & Answer Generation ---
+<script>
+let recognition = null;
+let isListening = false;
+
+if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    recognition = new SpeechRecognition();
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.lang = 'hi-IN';
+
+    recognition.onresult = function(event) {
+        const transcript = event.results[0][0].transcript;
+        document.getElementById('murliInput').value = transcript;
+        stopMic();
+        submitQuery();
+    };
+
+    recognition.onerror = function(event) { stopMic(); };
+    recognition.onend = function() { stopMic(); };
+}
+
+function toggleMic() {
+    if (!recognition) {
+        alert("Speech recognition is not supported in this browser. Please use Chrome or Safari.");
+        return;
+    }
+    if (isListening) {
+        recognition.stop();
+        stopMic();
+    } else {
+        recognition.start();
+        startMic();
+    }
+}
+
+function startMic() {
+    isListening = true;
+    const btn = document.getElementById('micBtn');
+    btn.classList.add('listening');
+    btn.innerHTML = '⏹️';
+}
+
+function stopMic() {
+    isListening = false;
+    const btn = document.getElementById('micBtn');
+    btn.classList.remove('listening');
+    btn.innerHTML = '🎙️';
+}
+
+function submitQuery() {
+    const query = document.getElementById('murliInput').value.trim();
+    if (query) {
+        const url = new URL(window.location.href);
+        url.searchParams.set('q', query);
+        window.location.href = url.toString();
+    }
+}
+</script>
+""", unsafe_allow_html=True)
+
+# Capture query from URL parameters
+query_params = st.query_params
+active_prompt = query_params.get("q", None)
+
 if active_prompt:
+    st.query_params.clear()
+
     st.session_state.messages.append({"role": "user", "content": active_prompt})
     with st.chat_message("user"):
         st.markdown(active_prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Analyzing up to 50 candidate Murlis and synthesizing 15-25 comprehensive points..."):
+        with st.spinner("Analyzing Murlis and synthesizing 15-25 comprehensive points..."):
             intent = extract_search_intent(active_prompt, ui_section_override=section_choice)
             matches, strategy_used = search_turso(intent, final_limit=20)
-
             core_str = ", ".join(intent.get("core_concepts", []))
 
             if not matches:
                 answer = (
                     f"No matching Murlis found for: **{core_str}**.\n\n"
-                    f"💡 *Tip: Try simpler Hindi keywords like `पवित्रता सर्वशक्तिमान` or set 'Target Murli Section' to 'All Sections'.*"
+                    f"💡 *Tip: Try simpler Hindi keywords or set 'Target Murli Section' to 'All Sections'.*"
                 )
                 st.markdown(answer)
                 st.session_state.messages.append({"role": "assistant", "content": answer})
