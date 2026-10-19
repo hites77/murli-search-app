@@ -27,7 +27,7 @@ if not (gemini_key and turso_url and turso_token):
     st.stop()
 
 client = genai.Client(api_key=gemini_key.strip())
-MODEL_NAME = "gemini-2.0-flash"
+MODEL_NAME = "gemini-3.8-flash"
 
 # --- Section Marker Patterns (Upgrade 2) ---
 SECTION_MARKERS = {
