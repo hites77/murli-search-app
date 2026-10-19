@@ -28,7 +28,7 @@ if not (gemini_key and turso_url and turso_token):
 
 client = genai.Client(api_key=gemini_key.strip())
 
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-3.8-flash"
 FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
 
 SECTION_MARKERS = {
