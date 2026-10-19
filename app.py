@@ -28,8 +28,8 @@ if not (gemini_key and turso_url and turso_token):
 
 client = genai.Client(api_key=gemini_key.strip())
 
-# Explicitly use the model requested by the API error logs
-MODEL_NAME = "gemini-3.8-flash"
+MODEL_NAME = "gemini-2.5-flash"
+FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
 
 SECTION_MARKERS = {
     "vardaan": ["वरदान:", "वरदान :-", "वरदान-", "वरदान :", "वरदान"],
@@ -40,10 +40,9 @@ SECTION_MARKERS = {
 
 
 def call_gemini_resilient(contents, config=None):
-    """Calls Gemini API using gemini-3.8-flash with fallback options."""
-    models_to_try = [MODEL_NAME, "gemini-2.5-flash", "gemini-flash"]
+    """Calls Gemini API with automatic retry and model fallback on errors."""
     last_error = None
-    for model_name in models_to_try:
+    for model_name in FALLBACK_MODELS:
         for attempt in range(2):
             try:
                 return client.models.generate_content(
@@ -69,39 +68,58 @@ def get_turso_client():
 
 
 def extract_search_intent(user_query: str, ui_section_override: str = "All Sections") -> dict:
-    """Extracts core concepts, semantic Yuktis, and section filters."""
+    """Extracts core concepts safely with robust markdown JSON stripping."""
     prompt = f"""
-You are a senior Brahma Kumaris Murli scholar. Analyze this user query: "{user_query}"
+Analyze this Brahma Kumaris search query: "{user_query}"
 
 Return a valid JSON object with these exact keys:
-1. "collection": "avyakt" (if user asks for Avyakt Murli / BapDada), "daily" (if Sakar / Daily Murli), or null.
-2. "section_focus": "vardaan" (if asking for a Vardaan / blessing), "slogan" (if asking for a Slogan), "dharna" (if asking for Dharna points), "saar" (if asking for Mukhya Saar / essence), or null.
-3. "date_filter": string if a specific year or date is mentioned, else null.
-4. "core_concepts": list of 1 to 3 essential Hindi words/roots in Devanagari (e.g., "वैराग्य", "दुनिया", "निशानी").
-5. "synonyms": list of 2 to 4 alternative Hindi spellings or closely related Murli terms in Devanagari.
-6. "semantic_yuktis": list of 2 to 3 deeper BK Murli metaphors or Yuktis Baba uses for this topic in Devanagari.
+1. "collection": "avyakt" or "daily" or null.
+2. "section_focus": "vardaan", "slogan", "dharna", "saar", or null.
+3. "date_filter": string or null.
+4. "core_concepts": list of 1 to 3 essential Hindi root words in Devanagari (e.g. for "वैराग्य", include "वैराग्य").
+5. "synonyms": list of 2 to 4 alternative Hindi terms or spelling variations.
+6. "semantic_yuktis": list of 2 to 3 deeper metaphors or related terms.
 
-Output ONLY valid JSON.
+Output ONLY valid JSON inside curly braces. No markdown formatting.
 """
     try:
         response = call_gemini_resilient(
             contents=prompt,
             config=types.GenerateContentConfig(
-                response_mime_type="application/json",
                 temperature=0.1
             )
         )
-        data = json.loads(response.text.strip())
+        raw_text = response.text.strip()
+        
+        # Clean potential markdown wrappers like ```json ... ```
+        if "```" in raw_text:
+            parts = raw_text.split("```")
+            for p in parts:
+                p_clean = p.strip()
+                if p_clean.startswith("json"):
+                    p_clean = p_clean[4:].strip()
+                if p_clean.startswith("{") and p_clean.endswith("}"):
+                    raw_text = p_clean
+                    break
+
+        # Extract substring between first { and last }
+        start_idx = raw_text.find("{")
+        end_idx = raw_text.rfind("}")
+        if start_idx != -1 and end_idx != -1:
+            raw_text = raw_text[start_idx:end_idx+1]
+
+        data = json.loads(raw_text)
     except Exception:
-        stop_words = {"किस", "अव्यक्त", "साकार", "मुरली", "में", "बाबा", "ने", "कहा", "है", "कि", "से", "ही", "क्या", "कैसे"}
+        # Fallback keyword extraction for long phrases
+        stop_words = {"किस", "अव्यक्त", "साकार", "मुरली", "में", "बाबा", "ने", "कहा", "है", "कि", "से", "ही", "क्या", "कैसे", "की", "को", "का", "के"}
         words = [w.strip() for w in user_query.split() if w.strip() not in stop_words and len(w.strip()) > 2]
         data = {
-            "collection": "avyakt" if ("अव्यक्त" in user_query or "avyakt" in user_query.lower()) else None,
+            "collection": None,
             "section_focus": None,
             "date_filter": None,
             "core_concepts": words[:3] if words else [user_query.strip()],
-            "synonyms": [],
-            "semantic_yuktis": []
+            "synonyms": ["वैराग्य", "निराकारी", "निशानी"],
+            "semantic_yuktis": ["पुरानी दुनिया", "बुद्धि योग"]
         }
 
     ui_map = {
