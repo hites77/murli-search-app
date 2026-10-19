@@ -28,10 +28,8 @@ if not (gemini_key and turso_url and turso_token):
 
 client = genai.Client(api_key=gemini_key.strip())
 
-FALLBACK_MODELS = ["gemini-3.8-flash",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-]
+# Explicitly use the model requested by the API error logs
+MODEL_NAME = "gemini-3.8-flash"
 
 SECTION_MARKERS = {
     "vardaan": ["वरदान:", "वरदान :-", "वरदान-", "वरदान :", "वरदान"],
@@ -42,9 +40,10 @@ SECTION_MARKERS = {
 
 
 def call_gemini_resilient(contents, config=None):
-    """Calls Gemini API with automatic retry and model fallback on errors."""
+    """Calls Gemini API using gemini-3.8-flash with fallback options."""
+    models_to_try = [MODEL_NAME, "gemini-2.5-flash", "gemini-flash"]
     last_error = None
-    for model_name in FALLBACK_MODELS:
+    for model_name in models_to_try:
         for attempt in range(2):
             try:
                 return client.models.generate_content(
@@ -67,26 +66,6 @@ def get_turso_client():
     """Connects to Turso via stateless HTTPS."""
     http_url = turso_url.strip().replace("libsql://", "https://")
     return libsql_client.create_client_sync(url=http_url, auth_token=turso_token.strip())
-
-
-def transcribe_audio(audio_bytes: bytes, mime_type: str) -> str:
-    """Uses Gemini multimodal audio processing to transcribe spoken queries."""
-    prompt = (
-        "Listen to this audio and transcribe the spoken Hindi, English, or Hinglish question accurately. "
-        "It is a question about Brahma Kumaris Murli concepts. "
-        "Prefer Devanagari Hindi script for Hindi words. Return ONLY the plain transcribed text."
-    )
-    try:
-        response = call_gemini_resilient(
-            contents=[
-                types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
-                prompt
-            ]
-        )
-        return response.text.strip()
-    except Exception as e:
-        st.error(f"Voice Transcription Error: {e}")
-        return ""
 
 
 def extract_search_intent(user_query: str, ui_section_override: str = "All Sections") -> dict:
@@ -510,7 +489,7 @@ function stopSpeech() {
 </script>
 """, unsafe_allow_html=True)
 
-# --- Native Streamlit Chat Input (Guaranteed to work on Enter & Mobile) ---
+# --- Native Streamlit Chat Input ---
 active_prompt = st.chat_input("Ask question, Vardaan, or Slogan in Hindi or English...")
 
 if active_prompt:
