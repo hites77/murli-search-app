@@ -18,7 +18,7 @@ st.caption("Ask questions across 8,200+ discourses in Hindi, English, or Hinglis
 # Database Configuration
 DB_PATH = "murli_search.db"
 # Replace with your actual Google Drive File ID from Step 1:
-GDRIVE_FILE_ID = "YOUR_GOOGLE_DRIVE_FILE_ID_HERE"
+GDRIVE_FILE_ID = "1AOvN9VzhJ7X3R-TKWDTXHOyCWTIGt6El"
 
 @st.cache_resource(show_spinner=False)
 def ensure_database():
