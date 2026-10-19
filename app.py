@@ -28,8 +28,7 @@ if not (gemini_key and turso_url and turso_token):
 
 client = genai.Client(api_key=gemini_key.strip())
 
-# Updated active model list
-FALLBACK_MODELS = [
+FALLBACK_MODELS = ["gemini-3.8-flash",
     "gemini-2.5-flash",
     "gemini-2.0-flash",
 ]
@@ -70,6 +69,26 @@ def get_turso_client():
     return libsql_client.create_client_sync(url=http_url, auth_token=turso_token.strip())
 
 
+def transcribe_audio(audio_bytes: bytes, mime_type: str) -> str:
+    """Uses Gemini multimodal audio processing to transcribe spoken queries."""
+    prompt = (
+        "Listen to this audio and transcribe the spoken Hindi, English, or Hinglish question accurately. "
+        "It is a question about Brahma Kumaris Murli concepts. "
+        "Prefer Devanagari Hindi script for Hindi words. Return ONLY the plain transcribed text."
+    )
+    try:
+        response = call_gemini_resilient(
+            contents=[
+                types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+                prompt
+            ]
+        )
+        return response.text.strip()
+    except Exception as e:
+        st.error(f"Voice Transcription Error: {e}")
+        return ""
+
+
 def extract_search_intent(user_query: str, ui_section_override: str = "All Sections") -> dict:
     """Extracts core concepts, semantic Yuktis, and section filters."""
     prompt = f"""
@@ -79,7 +98,7 @@ Return a valid JSON object with these exact keys:
 1. "collection": "avyakt" (if user asks for Avyakt Murli / BapDada), "daily" (if Sakar / Daily Murli), or null.
 2. "section_focus": "vardaan" (if asking for a Vardaan / blessing), "slogan" (if asking for a Slogan), "dharna" (if asking for Dharna points), "saar" (if asking for Mukhya Saar / essence), or null.
 3. "date_filter": string if a specific year or date is mentioned, else null.
-4. "core_concepts": list of 1 to 3 essential Hindi words/roots in Devanagari (e.g., "वैराग्य", "दुनिया", "निशानी"). Do NOT include generic words like बाबा, मुरली.
+4. "core_concepts": list of 1 to 3 essential Hindi words/roots in Devanagari (e.g., "वैराग्य", "दुनिया", "निशानी").
 5. "synonyms": list of 2 to 4 alternative Hindi spellings or closely related Murli terms in Devanagari.
 6. "semantic_yuktis": list of 2 to 3 deeper BK Murli metaphors or Yuktis Baba uses for this topic in Devanagari.
 
@@ -95,7 +114,7 @@ Output ONLY valid JSON.
         )
         data = json.loads(response.text.strip())
     except Exception:
-        stop_words = {"किस", "अव्यक्त", "साकार", "मुरली", "में", "बाबा", "ने", "कहा", "है", "कि", "से", "ही", "क्या", "कैसे", "निशानी", "क्या", "होगी"}
+        stop_words = {"किस", "अव्यक्त", "साकार", "मुरली", "में", "बाबा", "ने", "कहा", "है", "कि", "से", "ही", "क्या", "कैसे"}
         words = [w.strip() for w in user_query.split() if w.strip() not in stop_words and len(w.strip()) > 2]
         data = {
             "collection": "avyakt" if ("अव्यक्त" in user_query or "avyakt" in user_query.lower()) else None,
@@ -420,7 +439,7 @@ Provide a comprehensive, highly detailed response covering 15 to 25 distinct poi
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# --- Search Filters & Input UI ---
+# --- Search Filters UI ---
 with st.expander("🔍 Search Filters", expanded=False):
     section_choice = st.selectbox(
         "Target Murli Section:",
@@ -491,127 +510,10 @@ function stopSpeech() {
 </script>
 """, unsafe_allow_html=True)
 
-# --- Native HTML/JS Input Bar with Built-in Mic & Unrestricted Keyboard ---
-st.markdown("""
-<style>
-.search-container {
-    display: flex;
-    align-items: center;
-    background-color: #262730;
-    border: 1px solid #41424C;
-    border-radius: 24px;
-    padding: 6px 14px;
-    margin-top: 10px;
-    margin-bottom: 20px;
-}
-.search-input {
-    flex: 1;
-    background: transparent;
-    border: none;
-    color: #ffffff;
-    font-size: 16px;
-    outline: none;
-    padding: 8px 4px;
-}
-.mic-btn {
-    background: #ff4b4b;
-    border: none;
-    border-radius: 50%;
-    width: 38px;
-    height: 38px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    color: white;
-    font-size: 18px;
-    margin-left: 8px;
-    transition: background 0.2s;
-}
-.mic-btn.listening {
-    background: #28a745;
-    animation: pulse 1.5s infinite;
-}
-@keyframes pulse {
-    0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(40, 167, 69, 0.7); }
-    70% { transform: scale(1.08); box-shadow: 0 0 0 10px rgba(40, 167, 69, 0); }
-    100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(40, 167, 69, 0); }
-}
-</style>
-
-<div class="search-container">
-    <input type="text" id="murliInput" class="search-input" placeholder="Ask question, Vardaan, or Slogan..." onkeydown="if(event.key === 'Enter') submitQuery()">
-    <button id="micBtn" class="mic-btn" onclick="toggleMic()" title="Voice Search">🎙️</button>
-</div>
-
-<script>
-let recognition = null;
-let isListening = false;
-
-if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    recognition = new SpeechRecognition();
-    recognition.continuous = false;
-    recognition.interimResults = false;
-    recognition.lang = 'hi-IN';
-
-    recognition.onresult = function(event) {
-        const transcript = event.results[0][0].transcript;
-        document.getElementById('murliInput').value = transcript;
-        stopMic();
-        submitQuery();
-    };
-
-    recognition.onerror = function(event) { stopMic(); };
-    recognition.onend = function() { stopMic(); };
-}
-
-function toggleMic() {
-    if (!recognition) {
-        alert("Speech recognition is not supported in this browser. Please use Chrome or Safari.");
-        return;
-    }
-    if (isListening) {
-        recognition.stop();
-        stopMic();
-    } else {
-        recognition.start();
-        startMic();
-    }
-}
-
-function startMic() {
-    isListening = true;
-    const btn = document.getElementById('micBtn');
-    btn.classList.add('listening');
-    btn.innerHTML = '⏹️';
-}
-
-function stopMic() {
-    isListening = false;
-    const btn = document.getElementById('micBtn');
-    btn.classList.remove('listening');
-    btn.innerHTML = '🎙️';
-}
-
-function submitQuery() {
-    const query = document.getElementById('murliInput').value.trim();
-    if (query) {
-        const url = new URL(window.location.href);
-        url.searchParams.set('q', query);
-        window.location.href = url.toString();
-    }
-}
-</script>
-""", unsafe_allow_html=True)
-
-# Capture query from URL parameters
-query_params = st.query_params
-active_prompt = query_params.get("q", None)
+# --- Native Streamlit Chat Input (Guaranteed to work on Enter & Mobile) ---
+active_prompt = st.chat_input("Ask question, Vardaan, or Slogan in Hindi or English...")
 
 if active_prompt:
-    st.query_params.clear()
-
     st.session_state.messages.append({"role": "user", "content": active_prompt})
     with st.chat_message("user"):
         st.markdown(active_prompt)
