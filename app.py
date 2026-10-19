@@ -1,6 +1,6 @@
 import hashlib
 import json
-import re
+import time
 import streamlit as st
 import libsql_client
 from google import genai
@@ -15,7 +15,7 @@ st.set_page_config(
 )
 
 st.title("🕊️ Murli Search Assistant")
-st.caption("Semantic + Section-Aware Search across 8,200+ Sakar & Avyakt Murlis.")
+st.caption("Deep Semantic & Section-Aware Search across 8,200+ Sakar & Avyakt Murlis.")
 
 # --- Retrieve & Validate Secrets ---
 gemini_key = st.secrets.get("GEMINI_API_KEY")
@@ -27,7 +27,13 @@ if not (gemini_key and turso_url and turso_token):
     st.stop()
 
 client = genai.Client(api_key=gemini_key.strip())
-MODEL_NAME = "gemini-3.8-flash"
+
+# Automatic fallback list when a model experiences 503 High Demand
+FALLBACK_MODELS = ["gemini-3.8-flash",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash",
+]
 
 # --- Section Marker Patterns (Upgrade 2) ---
 SECTION_MARKERS = {
@@ -36,6 +42,28 @@ SECTION_MARKERS = {
     "dharna": ["धारणा के लिए मुख्य सार", "धारणा के लिए", "धारणा:-", "धारणा :"],
     "saar": ["मीठे बच्चे", "प्रातःमुरली", "मुख्य सार"]
 }
+
+
+def call_gemini_resilient(contents, config=None):
+    """Calls Gemini API with automatic retry and model fallback on 503/429 errors."""
+    last_error = None
+    for model_name in FALLBACK_MODELS:
+        for attempt in range(2):
+            try:
+                return client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=config
+                )
+            except Exception as e:
+                last_error = e
+                err_str = str(e).upper()
+                if any(k in err_str for k in ["503", "UNAVAILABLE", "OVERLOADED", "HIGH DEMAND", "429", "404", "NOT_FOUND"]):
+                    time.sleep(1.2 * (attempt + 1))
+                    continue
+                else:
+                    raise e
+    raise last_error
 
 
 def get_turso_client():
@@ -52,8 +80,7 @@ def transcribe_audio(audio_bytes: bytes, mime_type: str) -> str:
         "Prefer Devanagari Hindi script for Hindi words. Return ONLY the plain transcribed text."
     )
     try:
-        response = client.models.generate_content(
-            model=MODEL_NAME,
+        response = call_gemini_resilient(
             contents=[
                 types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
                 prompt
@@ -65,12 +92,8 @@ def transcribe_audio(audio_bytes: bytes, mime_type: str) -> str:
         return ""
 
 
-def extract_search_intent(user_query: str, ui_section_override: str = "All") -> dict:
-    """
-    UPGRADE 1 & 2:
-    Extracts core concepts, BK spiritual metaphors/Yuktis (Semantic Expansion),
-    and detects specific Murli sections (Vardaan, Slogan, Dharna, Saar).
-    """
+def extract_search_intent(user_query: str, ui_section_override: str = "All Sections") -> dict:
+    """Extracts core concepts, semantic Yuktis, and section filters."""
     prompt = f"""
 You are a senior Brahma Kumaris Murli scholar. Analyze this user query: "{user_query}"
 
@@ -79,14 +102,13 @@ Return a valid JSON object with these exact keys:
 2. "section_focus": "vardaan" (if asking for a Vardaan / blessing), "slogan" (if asking for a Slogan), "dharna" (if asking for Dharna points), "saar" (if asking for Mukhya Saar / essence), or null.
 3. "date_filter": string (e.g., "1979", "2022-07", "18-01") if a specific year or date is mentioned, else null.
 4. "core_concepts": list of 1 to 3 essential Hindi words/roots in Devanagari (e.g., "पवित्रता", "मास्टर", "सर्वशक्ति"). Do NOT include generic words like बाबा, मुरली, वरदान, स्लोगन, कहा, क्या, कैसे.
-5. "synonyms": list of 2 to 4 alternative Hindi spellings or closely related Murli terms in Devanagari (e.g., "सर्वशक्तिवान", "सर्वशक्तिमान", "पवित्र").
-6. "semantic_yuktis": list of 2 to 3 deeper BK Murli metaphors or Yuktis Baba uses for this topic in Devanagari (e.g., if user asks about obstacles/fear -> ["विघ्न", "पहाड़", "साक्षी दृष्टा", "अचल"]; if purity/power -> ["फाउंडेशन", "ब्रह्मचर्य", "विजयी रत्न"]).
+5. "synonyms": list of 2 to 4 alternative Hindi spellings or closely related Murli terms in Devanagari.
+6. "semantic_yuktis": list of 2 to 3 deeper BK Murli metaphors or Yuktis Baba uses for this topic in Devanagari.
 
 Output ONLY valid JSON.
 """
     try:
-        response = client.models.generate_content(
-            model=MODEL_NAME,
+        response = call_gemini_resilient(
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -106,7 +128,6 @@ Output ONLY valid JSON.
             "semantic_yuktis": []
         }
 
-    # Apply UI Filter Override if user selected a specific chip
     ui_map = {
         "वरदान (Vardaan)": "vardaan",
         "स्लोगन (Slogan)": "slogan",
@@ -123,10 +144,7 @@ Output ONLY valid JSON.
 
 
 def parse_murli_sections(full_text: str) -> dict:
-    """
-    UPGRADE 2: Automatically isolates Mukhya Saar, Dharna, Vardaan, and Slogan 
-    from the raw Murli text so Gemini can see exact structured sections.
-    """
+    """Isolates Mukhya Saar, Dharna, Vardaan, and Slogan from the Murli text."""
     if not full_text:
         return {"saar": "", "dharna": "", "vardaan": "", "slogan": ""}
 
@@ -137,25 +155,21 @@ def parse_murli_sections(full_text: str) -> dict:
         "slogan": ""
     }
 
-    # Search in the bottom 45% of the Murli where Dharna, Vardaan, and Slogan appear
     tail_start = max(0, int(len(full_text) * 0.55))
     tail_text = full_text[tail_start:]
 
-    # Locate Dharna
     for marker in SECTION_MARKERS["dharna"]:
         idx = tail_text.find(marker)
         if idx != -1:
             sections["dharna"] = tail_text[idx:idx + 1200].strip()
             break
 
-    # Locate Vardaan
     for marker in SECTION_MARKERS["vardaan"]:
         idx = tail_text.rfind(marker)
         if idx != -1:
             sections["vardaan"] = tail_text[idx:idx + 900].strip()
             break
 
-    # Locate Slogan
     for marker in SECTION_MARKERS["slogan"]:
         idx = tail_text.rfind(marker)
         if idx != -1:
@@ -165,16 +179,8 @@ def parse_murli_sections(full_text: str) -> dict:
     return sections
 
 
-def score_and_extract_passages(full_text: str, intent: dict, window_chars: int = 950, max_windows: int = 3) -> tuple[str, float]:
-    """
-    UPGRADE 1 & 2:
-    Scores a Murli based on:
-    - Core keyword hits (+5 pts per unique core term, +1.5 per frequency)
-    - Synonym hits (+3 pts)
-    - Semantic Yukti hits (+2 pts)
-    - Section Focus bonus (+8 pts if terms appear inside the requested section like Vardaan/Slogan)
-    Extracts the highest-density windows plus the structured Vardaan/Slogan footer.
-    """
+def score_and_extract_passages(full_text: str, intent: dict, window_chars: int = 950, max_windows: int = 6) -> tuple[str, float]:
+    """Scores Murlis and extracts up to 6 high-density passages + footers."""
     if not full_text:
         return "", 0.0
 
@@ -186,7 +192,6 @@ def score_and_extract_passages(full_text: str, intent: dict, window_chars: int =
     all_search_terms = list(dict.fromkeys(core + syns + yuktis))
     sections = parse_murli_sections(full_text)
 
-    # Calculate semantic relevance score
     score = 0.0
     for c in core:
         count = full_text.count(c)
@@ -200,16 +205,14 @@ def score_and_extract_passages(full_text: str, intent: dict, window_chars: int =
         if y in full_text:
             score += 2.0
 
-    # Check if user wants a specific section (Vardaan / Slogan / Dharna / Saar)
     focused_section_text = ""
     if section_focus and sections.get(section_focus):
         focused_section_text = sections[section_focus]
         score += 4.0
         for term in all_search_terms:
             if term in focused_section_text:
-                score += 8.0  # Huge boost if the keyword is inside the requested Vardaan/Slogan!
+                score += 8.0
 
-    # Break Murli into overlapping chunks to find the highest-density spiritual paragraphs
     step = 750
     chunk_len = window_chars * 2
     scored_chunks = []
@@ -230,7 +233,6 @@ def score_and_extract_passages(full_text: str, intent: dict, window_chars: int =
         for y in yuktis:
             if y in chunk:
                 c_score += 1.5
-        # Proximity bonus when multiple distinct concepts appear in the same paragraph!
         if unique_hits >= 2:
             c_score += unique_hits * 4.0
         if c_score > 0:
@@ -238,8 +240,7 @@ def score_and_extract_passages(full_text: str, intent: dict, window_chars: int =
 
     scored_chunks.sort(key=lambda x: x[0], reverse=True)
 
-    # Pick top non-overlapping chunks
-    selected_Passages = []
+    selected_passages = []
     used_ranges = []
     for c_score, s, e, chunk in scored_chunks:
         if any(not (e < us or s > ue) for us, ue in used_ranges):
@@ -247,25 +248,22 @@ def score_and_extract_passages(full_text: str, intent: dict, window_chars: int =
         used_ranges.append((s, e))
         prefix = "..." if s > 0 else ""
         suffix = "..." if e < len(full_text) else ""
-        selected_Passages.append(f"{prefix}{chunk.strip()}{suffix}")
-        if len(selected_Passages) >= max_windows:
+        selected_passages.append(f"{prefix}{chunk.strip()}{suffix}")
+        if len(selected_passages) >= max_windows:
             break
 
-    # Add top proximity bonus to overall document score
     if scored_chunks:
         score += scored_chunks[0][0]
 
-    # Assemble final context block for this Murli
     blocks = []
     if focused_section_text:
         blocks.append(f"🎯 [TARGETED SECTION — {section_focus.upper()}]:\n{focused_section_text}")
 
-    if selected_Passages:
-        blocks.append("📜 [MATCHING MURLI PARAGRAPHS]:\n" + "\n\n---\n\n".join(selected_Passages))
+    if selected_passages:
+        blocks.append("📜 [MATCHING MURLI PARAGRAPHS]:\n" + "\n\n---\n\n".join(selected_passages))
     else:
         blocks.append(full_text[:1800])
 
-    # Always attach Vardaan & Slogan at the bottom if present and not already duplicated
     footer_parts = []
     if sections["vardaan"] and section_focus != "vardaan":
         footer_parts.append(f"✨ [वरदान / Vardaan]: {sections['vardaan'][:450]}")
@@ -277,12 +275,8 @@ def score_and_extract_passages(full_text: str, intent: dict, window_chars: int =
     return "\n\n".join(blocks), score
 
 
-def search_turso(intent: dict, final_limit: int = 6) -> tuple[list[dict], str]:
-    """
-    Two-Stage Retrieval:
-    Stage 1: Cascading FTS5 search retrieves up to 15 candidate Murlis from Turso.
-    Stage 2: Python Semantic & Section Re-Ranker scores all 15 candidates and returns top `final_limit`.
-    """
+def search_turso(intent: dict, final_limit: int = 20) -> tuple[list[dict], str]:
+    """Retrieves up to 50 candidate Murlis and returns the top 20 re-ranked results."""
     core = [t.replace('"', '').replace("'", "").strip() for t in intent.get("core_concepts", []) if t.strip()]
     syns = [t.replace('"', '').replace("'", "").strip() for t in intent.get("synonyms", []) if t.strip()]
     yuktis = [t.replace('"', '').replace("'", "").strip() for t in intent.get("semantic_yuktis", []) if t.strip()]
@@ -302,31 +296,26 @@ def search_turso(intent: dict, final_limit: int = 6) -> tuple[list[dict], str]:
 
     fts_tiers = []
 
-    # Tier 0 (Section-Specific): If user asked for a Vardaan/Slogan/Dharna, search for the section header AND concepts
     if section_term and core:
         core_or_syn = " OR ".join([f'"{t}"' for t in (core + syns)])
         fts_tiers.append((f"Section-Targeted ({section_term})", f'"{section_term}" AND ({core_or_syn})'))
 
-    # Tier 1: All core concepts (Strict AND)
     if len(core) >= 2:
         fts_tiers.append(("Strict Concept Match", " AND ".join([f'"{c}"' for c in core])))
 
-    # Tier 2: First core concept + any synonym or semantic yukti
     if len(core) >= 1 and len(all_terms) >= 2:
         others = " OR ".join([f'"{t}"' for t in all_terms[1:]])
         fts_tiers.append(("Contextual + Synonym Match", f'"{core[0]}" AND ({others})'))
 
-    # Tier 3: Pairwise combinations of top 3 terms
     if len(core) >= 3:
         pair_q = f'("{core[0]}" AND "{core[1]}") OR ("{core[0]}" AND "{core[2]}") OR ("{core[1]}" AND "{core[2]}")'
         fts_tiers.append(("Pairwise Concept Match", pair_q))
 
-    # Tier 4: Broad Semantic + Yukti OR match
     fts_tiers.append(("Semantic & Yukti Expansion", " OR ".join([f'"{t}"' for t in all_terms])))
 
     coll_target = intent.get("collection")
     date_target = intent.get("date_filter")
-    candidate_pool_size = 15  # Fetch 15 candidates for Stage-2 semantic re-ranking
+    candidate_pool_size = 50  # Increased candidate pool for comprehensive coverage
 
     def fetch_candidates(enforce_collection: bool) -> tuple[list, str]:
         where_clauses = ["murlis_fts MATCH ?"]
@@ -372,7 +361,7 @@ def search_turso(intent: dict, final_limit: int = 6) -> tuple[list[dict], str]:
                                 candidates.append(r)
                             if len(candidates) >= candidate_pool_size:
                                 break
-                    if len(candidates) >= 8:
+                    if len(candidates) >= 25:
                         break
                 except Exception:
                     continue
@@ -384,7 +373,6 @@ def search_turso(intent: dict, final_limit: int = 6) -> tuple[list[dict], str]:
         raw_rows, strategy_label = fetch_candidates(enforce_collection=False)
         strategy_label += " (All Collections)"
 
-    # --- STAGE 2: Semantic & Section Re-Ranking ---
     scored_results = []
     for r in raw_rows:
         m_date = str(r[0]) if r[0] else "Unknown Date"
@@ -405,18 +393,16 @@ def search_turso(intent: dict, final_limit: int = 6) -> tuple[list[dict], str]:
             "score": round(relevance_score, 1)
         })
 
-    # Sort candidates by semantic + section relevance score (highest first)
     scored_results.sort(key=lambda x: x["score"], reverse=True)
-
     return scored_results[:final_limit], strategy_label
 
 
 def ask_gemini(question: str, context_chunks: list[dict], intent: dict) -> str:
-    """Synthesizes a deeply grounded response quoting Baba's exact words and section references."""
+    """Synthesizes a comprehensive response covering 15 to 25 distinct points with exact quotes."""
     context_blocks = []
     for idx, item in enumerate(context_chunks, 1):
         context_blocks.append(
-            f"=== [Murli {idx} | Collection: {item['type']} | Date: {item['date']} | Relevance Score: {item['score']}] ===\n"
+            f"=== [Murli {idx} | Collection: {item['type']} | Date: {item['date']}] ===\n"
             f"{item['text']}\n"
         )
     formatted_context = "\n\n".join(context_blocks)
@@ -437,10 +423,12 @@ def ask_gemini(question: str, context_chunks: list[dict], intent: dict) -> str:
         "1. GROUNDED IN MURLI: Base your answer strictly on the provided Murli excerpts. Never invent dates or quotes.\n"
         "2. EXACT QUOTES (बाबा के महावाक्य): Always quote Baba's exact Hindi words from the excerpt inside blockquotes "
         "(> **\"...\"**) before explaining the point.\n"
-        "3. CLEAR CITATIONS: Cite the exact Collection (Sakar/Daily or Avyakt), Murli Date, and Section (e.g., मुख्य सार, धारणा, वरदान, स्लोगन) for every point.\n"
-        "4. SPIRITUAL DEPTH: Connect related spiritual expressions naturally (e.g., पवित्रता -> मास्टर सर्वशक्तिवान/सर्वशक्तिमान, "
-        "विघ्न -> पहाड़ को राई, साक्षी दृष्टा). Explain Baba's practical Yukti (method for Purusharth) clearly.\n"
-        "5. LANGUAGE: Respond in the language the user asked in (Hindi or English)."
+        "3. COMPREHENSIVE SYNTHESIS (15–25 POINTS): Do not limit yourself to just 4 or 5 points. Provide a thorough, "
+        "comprehensive, multi-faceted breakdown covering 15 to 25 distinct spiritual points/aspects found across the excerpts, "
+        "categorizing them clearly under bullet points or sub-headings.\n"
+        "4. CLEAR CITATIONS: Cite the exact Collection and Murli Date for every point or quote.\n"
+        "5. SPIRITUAL DEPTH: Connect related spiritual expressions and explain Baba's practical Purusharth Yuktis.\n"
+        "6. LANGUAGE: Respond in the language the user asked in (Hindi or English)."
         + section_instruction
     )
 
@@ -452,7 +440,7 @@ Semantic Yuktis Searched: {', '.join(intent.get('semantic_yuktis', []))}
 Retrieved Murli Excerpts:
 {formatted_context}
 
-Provide a clear, spiritually accurate, well-structured response quoting Baba's exact words and citing the Murli dates.
+Provide a comprehensive, highly detailed response covering 15 to 25 distinct points, quoting Baba's exact words and citing the Murli dates.
 """
 
     try:
@@ -460,14 +448,13 @@ Provide a clear, spiritually accurate, well-structured response quoting Baba's e
             system_instruction=system_instruction,
             temperature=0.2,
         )
-        response = client.models.generate_content(
-            model=MODEL_NAME,
+        response = call_gemini_resilient(
             contents=prompt,
             config=config
         )
         return response.text
     except Exception as e:
-        return f"⚠️ Gemini API Error: {e}"
+        return f"⚠️ Gemini API Error (all fallback models busy): {e}"
 
 
 # --- Session State Initialization ---
@@ -495,7 +482,7 @@ for msg in st.session_state.messages:
         if msg.get("sources"):
             with st.expander("📖 View Original Murli Excerpts, Vardaans & Snippets"):
                 for s in msg["sources"]:
-                    st.markdown(f"**{s['type'].upper()} — {s['date']}** *(Match Score: {s.get('score', '-')})*")
+                    st.markdown(f"**{s['type'].upper()} — {s['date']}**")
                     if s.get("vardaan"):
                         st.info(f"✨ **{s['vardaan']}**")
                     if s.get("slogan"):
@@ -507,7 +494,6 @@ text_prompt = st.chat_input("Ask any Murli question, Vardaan, or Slogan...")
 
 active_prompt = None
 
-# Process voice input ONLY if it is a new recording
 if voice_file is not None:
     audio_bytes = voice_file.read()
     audio_hash = hashlib.md5(audio_bytes).hexdigest()
@@ -529,12 +515,11 @@ if active_prompt:
         st.markdown(active_prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Expanding spiritual concepts, checking sections & ranking Murlis..."):
+        with st.spinner("Analyzing up to 50 candidate Murlis and synthesizing 15-25 comprehensive points..."):
             intent = extract_search_intent(active_prompt, ui_section_override=section_choice)
-            matches, strategy_used = search_turso(intent, final_limit=6)
+            matches, strategy_used = search_turso(intent, final_limit=20)
 
             core_str = ", ".join(intent.get("core_concepts", []))
-            yukti_str = ", ".join(intent.get("semantic_yuktis", []))
 
             if not matches:
                 answer = (
@@ -548,15 +533,15 @@ if active_prompt:
                 sec_badge = f" | Section: `{intent['section_focus'].upper()}`" if intent.get("section_focus") else ""
                 sources_md = (
                     f"\n\n---\n**📚 Murlis Consulted** *(Mode: {strategy_used}{sec_badge} | "
-                    f"Concepts: `{core_str}` | Semantic Yuktis: `{yukti_str}`)*:\n"
-                    + "\n".join([f"- **{m['type'].title()}** ({m['date']}) — *Score: {m['score']}*" for m in matches])
+                    f"Concepts: `{core_str}`)*:\n"
+                    + "\n".join([f"- **{m['type'].title()}** ({m['date']})" for m in matches])
                 )
                 full_response = answer + sources_md
                 st.markdown(full_response)
 
                 with st.expander("📖 View Original Murli Excerpts, Vardaans & Snippets"):
                     for s in matches:
-                        st.markdown(f"**{s['type'].upper()} — {s['date']}** *(Match Score: {s['score']})*")
+                        st.markdown(f"**{s['type'].upper()} — {s['date']}**")
                         if s.get("vardaan"):
                             st.info(f"✨ **{s['vardaan']}**")
                         if s.get("slogan"):
