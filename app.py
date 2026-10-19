@@ -1,10 +1,8 @@
-import os
-import sqlite3
 import streamlit as st
-import gdown
+import libsql_client
 from google import genai
 
-# Page Configuration for Mobile
+# --- Mobile Page Configuration ---
 st.set_page_config(
     page_title="Murli Search AI",
     page_icon="🕊️",
@@ -15,34 +13,27 @@ st.set_page_config(
 st.title("🕊️ Murli Search Assistant")
 st.caption("Ask questions across 8,200+ discourses in Hindi, English, or Hinglish.")
 
-# Database Configuration
-DB_PATH = "murli_search.db"
-# Replace with your actual Google Drive File ID from Step 1:
-GDRIVE_FILE_ID = "1AOvN9VzhJ7X3R-TKWDTXHOyCWTIGt6El"
+# --- Retrieve Credentials ---
+gemini_key = st.secrets.get("GEMINI_API_KEY")
+turso_url = st.secrets.get("TURSO_DATABASE_URL")
+turso_token = st.secrets.get("TURSO_AUTH_TOKEN")
 
-@st.cache_resource(show_spinner=False)
-def ensure_database():
-    """Downloads the database from Google Drive if not present on server disk."""
-    if not os.path.exists(DB_PATH) or os.path.getsize(DB_PATH) < 100_000_000:
-        with st.spinner("Downloading Murli database archive (~400MB, one-time setup)..."):
-            url = f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}"
-            gdown.download(url, DB_PATH, quiet=False)
-
-# Ensure database is available
-ensure_database()
-
-# Retrieve API Key from Streamlit Secrets
-api_key = st.secrets.get("GEMINI_API_KEY")
-if not api_key:
-    st.error("Missing GEMINI_API_KEY. Please add it to your Streamlit App Secrets.")
+if not (gemini_key and turso_url and turso_token):
+    st.error("Missing configuration. Please verify GEMINI_API_KEY, TURSO_DATABASE_URL, and TURSO_AUTH_TOKEN in Streamlit Secrets.")
     st.stop()
 
-client = genai.Client(api_key=api_key)
+client = genai.Client(api_key=gemini_key)
 MODEL_NAME = "gemini-2.5-flash"
 
 
+def get_turso_client():
+    """Connects to Turso via HTTPS for serverless environments."""
+    http_url = turso_url.replace("libsql://", "https://")
+    return libsql_client.create_client_sync(url=http_url, auth_token=turso_token)
+
+
 def extract_keywords(user_query: str) -> str:
-    """Uses Gemini to extract core Hindi Devanagari root keywords."""
+    """Extracts 1 to 2 core Hindi root keywords for FTS5 lookup."""
     if len(user_query.split()) <= 2 and any('\u0900' <= c <= '\u097F' for c in user_query):
         return user_query.strip()
 
@@ -65,14 +56,8 @@ Examples:
         return user_query
 
 
-def search_database(search_term: str, limit: int = 5) -> list[dict]:
-    """Queries SQLite FTS5 trigram index."""
-    if not os.path.exists(DB_PATH):
-        return []
-
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
+def search_turso(search_term: str, limit: int = 5) -> list[dict]:
+    """Queries the remote Turso FTS5 trigram index."""
     sql = """
         SELECT 
             m.murli_date,
@@ -85,31 +70,31 @@ def search_database(search_term: str, limit: int = 5) -> list[dict]:
         ORDER BY rank
         LIMIT ?;
     """
+    formatted = f'"{search_term}"' if " " in search_term else search_term
 
+    rows = []
     try:
-        formatted = f'"{search_term}"' if " " in search_term else search_term
-        cursor.execute(sql, (formatted, limit))
-        rows = cursor.fetchall()
-    except sqlite3.OperationalError:
+        with get_turso_client() as db:
+            result = db.execute(sql, [formatted, limit])
+            rows = result.rows
+    except Exception:
         terms = search_term.split()
         if len(terms) > 1:
             try:
-                cursor.execute(sql, (" OR ".join(terms), limit))
-                rows = cursor.fetchall()
+                with get_turso_client() as db:
+                    result = db.execute(sql, [" OR ".join(terms), limit])
+                    rows = result.rows
             except Exception:
                 rows = []
-        else:
-            rows = []
-
-    conn.close()
 
     results = []
-    for date, coll, snip, full_content in rows:
+    for r in rows:
+        full_content = str(r[3]) if r[3] else ""
         results.append({
-            "date": date or "Unknown Date",
-            "type": coll or "Murli",
-            "snippet": snip,
-            "text": full_content[:2500] if full_content else snip
+            "date": str(r[0]) if r[0] else "Unknown Date",
+            "type": str(r[1]) if r[1] else "Murli",
+            "snippet": str(r[2]) if r[2] else "",
+            "text": full_content[:2500] if full_content else str(r[2])
         })
     return results
 
@@ -152,25 +137,23 @@ User Question: {question}
     return response.text
 
 
-# Initialize chat history
+# --- Chat Interface ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Display previous conversation
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# User Chat Input
 if prompt := st.chat_input("Type your question or phrase..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Searching archive..."):
+        with st.spinner("Searching cloud archive..."):
             keywords = extract_keywords(prompt)
-            matches = search_database(keywords, limit=5)
+            matches = search_turso(keywords, limit=5)
 
             if not matches:
                 answer = f"No direct records found for: **{keywords}**. Try searching with related spiritual terms like *सत्ययुग*, *अमृतवेला*, or *संतुष्टता*."
