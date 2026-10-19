@@ -1,6 +1,7 @@
 import streamlit as st
 import libsql_client
 from google import genai
+from google.genai import types
 
 # --- Mobile Page Configuration ---
 st.set_page_config(
@@ -22,18 +23,20 @@ if not (gemini_key and turso_url and turso_token):
     st.error("Missing configuration. Please verify GEMINI_API_KEY, TURSO_DATABASE_URL, and TURSO_AUTH_TOKEN in Streamlit Secrets.")
     st.stop()
 
-client = genai.Client(api_key=gemini_key)
+# Initialize Gemini Client
+client = genai.Client(api_key=gemini_key.strip())
 MODEL_NAME = "gemini-2.5-flash"
 
 
 def get_turso_client():
     """Connects to Turso via HTTPS for serverless environments."""
     http_url = turso_url.replace("libsql://", "https://")
-    return libsql_client.create_client_sync(url=http_url, auth_token=turso_token)
+    return libsql_client.create_client_sync(url=http_url, auth_token=turso_token.strip())
 
 
 def extract_keywords(user_query: str) -> str:
     """Extracts 1 to 2 core Hindi root keywords for FTS5 lookup."""
+    # If the user typed a short Hindi query directly, use it as-is
     if len(user_query.split()) <= 2 and any('\u0900' <= c <= '\u097F' for c in user_query):
         return user_query.strip()
 
@@ -43,6 +46,7 @@ Extract 1 to 2 core spiritual keywords in Devanagari Hindi as used in Brahma Kum
 Output ONLY the keywords in Hindi (no punctuation, no explanation, no english).
 Examples:
 - "When does Satyug begin?" -> सत्ययुग
+- "sangamyug" -> संगमयुग
 - "how to stay detached and observe" -> साक्षी दृष्टा
 - "मन को कैसे शांत करें" -> मन एकाग्र
 """
@@ -100,7 +104,7 @@ def search_turso(search_term: str, limit: int = 5) -> list[dict]:
 
 
 def ask_gemini(question: str, context_chunks: list[dict]) -> str:
-    """Builds grounded prompt with retrieved excerpts."""
+    """Builds grounded prompt with retrieved excerpts using standard SDK config."""
     context_blocks = []
     for idx, item in enumerate(context_chunks, 1):
         context_blocks.append(
@@ -126,15 +130,19 @@ Provided Murli Excerpts:
 User Question: {question}
 """
 
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-        config={
-            "system_instruction": system_instruction,
-            "temperature": 0.2,
-        }
-    )
-    return response.text
+    try:
+        config = types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            temperature=0.2,
+        )
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt,
+            config=config
+        )
+        return response.text
+    except Exception as e:
+        return f"⚠️ Gemini API Error: {e}"
 
 
 # --- Chat Interface ---
