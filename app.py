@@ -28,8 +28,7 @@ if not (gemini_key and turso_url and turso_token):
 
 client = genai.Client(api_key=gemini_key.strip())
 
-MODEL_NAME = "gemini-3.8-flash"
-FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
+
 
 SECTION_MARKERS = {
     "vardaan": ["वरदान:", "वरदान :-", "वरदान-", "वरदान :", "वरदान"],
@@ -38,26 +37,26 @@ SECTION_MARKERS = {
     "saar": ["मीठे बच्चे", "प्रातःमुरली", "मुख्य सार"]
 }
 
+MODEL_NAME = "gemini-3.8-flash"
 
 def call_gemini_resilient(contents, config=None):
-    """Calls Gemini API with automatic retry and model fallback on errors."""
+    """Calls Gemini API cleanly using the active model."""
     last_error = None
-    for model_name in FALLBACK_MODELS:
-        for attempt in range(2):
-            try:
-                return client.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=config
-                )
-            except Exception as e:
-                last_error = e
-                err_str = str(e).upper()
-                if any(k in err_str for k in ["503", "UNAVAILABLE", "OVERLOADED", "HIGH DEMAND", "429", "404", "NOT_FOUND"]):
-                    time.sleep(1.2 * (attempt + 1))
-                    continue
-                else:
-                    raise e
+    for attempt in range(3):
+        try:
+            return client.models.generate_content(
+                model=MODEL_NAME,
+                contents=contents,
+                config=config
+            )
+        except Exception as e:
+            last_error = e
+            err_str = str(e).upper()
+            if any(k in err_str for k in ["503", "UNAVAILABLE", "OVERLOADED", "HIGH DEMAND", "429"]):
+                time.sleep(1.2 * (attempt + 1))
+                continue
+            else:
+                raise e
     raise last_error
 
 
